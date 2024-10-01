@@ -16,7 +16,14 @@ On Windows: venv\Scripts\activate
 On macOS and Linux: source venv/bin/activate
 Install the required packages:
 
-pip install deriv-api python-dotenv numpy pandas scikit-learn TA-Lib aiohttp
+`Download C bindings for TA-Lib https://sourceforge.net/projects/ta-lib/`
+
+tar -zxvf `the tar package`
+./configure
+make
+sudo make install 
+
+pip install -r requirements.txt
 
 Note: Installing TA-Lib might be tricky on some systems. You may need to install it separately following the instructions for your operating system.
 
