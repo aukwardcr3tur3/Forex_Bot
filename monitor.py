@@ -1,356 +1,143 @@
-from backtester import Backtester
+import asyncio
+import logging
+import time
+from typing import Dict
 
+from config import Config
+from portfolio_manager import PortfolioManager
+from deriv_api import DerivAPI
+
+class PerformanceMonitor:
+    def __init__(self, portfolio_manager: PortfolioManager, logger: logging.Logger):
+        """Initialize performance monitor for tracking bot metrics.
+
+        Args:
+            portfolio_manager: PortfolioManager instance for position data.
+            logger: Logger for debugging and monitoring.
+        """
+        self.portfolio_manager = portfolio_manager
+        self.logger = logger
+        self.start_time = time.time()
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.total_profit = 0.0
+
+    async def update(self):
+        """Update and log performance metrics."""
+        try:
+            elapsed_time = time.time() - self.start_time
+            open_positions = self.portfolio_manager.get_open_positions()
+            total_exposure = self.portfolio_manager.get_total_exposure()
+            win_rate = self.winning_trades / self.total_trades if self.total_trades > 0 else 0
+            self.logger.info(
+                f"Performance Update: "
+                f"Elapsed time: {elapsed_time:.2f}s, "
+                f"Open positions: {open_positions}, "
+                f"Total exposure: {total_exposure}, "
+                f"Total trades: {self.total_trades}, "
+                f"Win rate: {win_rate:.2%}, "
+                f"Total profit: ${self.total_profit:.2f}"
+            )
+        except Exception as e:
+            self.logger.error(f"Error updating performance metrics: {e}")
+
+    def record_trade(self, profit: float):
+        """Record a trade outcome.
+
+        Args:
+            profit: Profit or loss from the trade.
+        """
+        self.total_trades += 1
+        if profit > 0:
+            self.winning_trades += 1
+        self.total_profit += profit
+        self.logger.info(f"Recorded trade: profit=${profit:.2f}, total_trades={self.total_trades}")
 
 class Monitor:
-    def __init__(self, config, trade_obj: Backtester) -> None:
+    def __init__(self, config: Config, portfolio_manager: PortfolioManager, api: DerivAPI, logger: logging.Logger):
+        """Initialize the Monitor for managing open positions and performance tracking.
 
-        self.trade_obj = trade_obj
-        self.order_status = self.trade_obj.order_status
-
+        Args:
+            config: Configuration object.
+            portfolio_manager: PortfolioManager instance for position tracking.
+            api: DerivAPI instance for platform interaction.
+            logger: Logger for debugging and monitoring.
+        """
         self.config = config
-        self.open_positions = {}
+        self.portfolio_manager = portfolio_manager
+        self.api = api
+        self.logger = logger
+        self.performance_monitor = PerformanceMonitor(portfolio_manager, logger)
 
-    def add_position(self, contract):
-        self.open_positions[contract['id']] = contract
+    async def check_open_positions(self):
+        """Check the status of all open positions and apply trailing stops."""
+        for symbol, contracts in self.portfolio_manager.positions.items():
+            for contract in contracts[:]:  # Copy to allow modification
+                contract_id = contract.get("contract_id")
+                if not contract_id:
+                    self.logger.warning(f"Invalid contract for {symbol}: missing contract_id")
+                    continue
+                try:
+                    updated_contract = await self.api.proposal_open_contract({"contract_id": contract_id})
+                    self.logger.debug(f"Contract status for {symbol}/{contract_id}: {updated_contract.get('status')}")
+                    if updated_contract.get("status") == "closed":
+                        profit = updated_contract.get("profit", 0.0)
+                        self.performance_monitor.record_trade(profit)
+                        self.portfolio_manager.close_trade(symbol, contract_id)
+                        self.logger.info(f"Closed contract {contract_id} for {symbol}, profit=${profit:.2f}")
+                    elif self.should_apply_trailing_stop(updated_contract):
+                        await self.apply_trailing_stop(updated_contract)
+                except Exception as e:
+                    self.logger.error(f"Error checking contract {contract_id} for {symbol}: {e}")
 
-    async def check_open_positions(self, api):
-        for contract_id, contract in list(self.open_positions.items()):
-            try:
-                updated_contract = await api.proposal_open_contract(contract_id)
-                if updated_contract['status'] == 'closed':
-                    del self.open_positions[contract_id]
-                elif self.should_apply_trailing_stop(updated_contract):
-                    await self.apply_trailing_stop(api, updated_contract)
-            except Exception as e:
-                print(f"Error checking position {contract_id}: {e}")
+    def should_apply_trailing_stop(self, contract: Dict) -> bool:
+        """Determine if a trailing stop should be applied.
 
-    def should_apply_trailing_stop(self, contract):
-        if 'current_spot' not in contract or 'entry_spot' not in contract:
+        Args:
+            contract: Contract details from DerivAPI.
+
+        Returns:
+            bool: True if trailing stop should be applied.
+        """
+        if not all(k in contract for k in ["current_spot", "entry_spot", "buy_price"]):
+            self.logger.debug(f"Contract missing required fields: {contract}")
             return False
-        profit_pips = (contract['current_spot'] - contract['entry_spot']) * 10000
-        return profit_pips > self.config.TRAILING_STOP_PIPS
-
-    async def apply_trailing_stop(self, api, contract):
-        new_stop_loss = contract['current_spot'] - (self.config.TRAILING_STOP_PIPS / 10000)
         try:
-            await api.sell({
-                "contract_id": contract['id'],
-                "price": new_stop_loss
-            })
+            profit_pips = (contract["current_spot"] - contract["entry_spot"]) * 10000
+            self.logger.debug(f"Profit for contract {contract['contract_id']}: {profit_pips:.2f} pips")
+            return profit_pips > self.config.TRAILING_STOP_PIPS
+        except (TypeError, ValueError) as e:
+            self.logger.error(f"Error calculating profit pips: {e}")
+            return False
+
+    async def apply_trailing_stop(self, contract: Dict):
+        """Apply a trailing stop to an open contract.
+
+        Args:
+            contract: Contract details from DerivAPI.
+        """
+        contract_id = contract.get("contract_id")
+        try:
+            new_stop_loss = contract["current_spot"] - (self.config.TRAILING_STOP_PIPS / 10000)
+            response = await self.api.sell({"contract_id": contract_id, "price": new_stop_loss})
+            self.logger.info(f"Applied trailing stop to {contract_id}: new_stop_loss={new_stop_loss}, response={response}")
         except Exception as e:
-            print(f"Error applying trailing stop to {contract['id']}: {e}")
+            self.logger.error(f"Failed to apply trailing stop to {contract_id}: {e}")
 
+    async def is_contract_active(self, contract_id: str) -> bool:
+        """Check if a contract is still active.
 
-    @property
-    def is_cancelled(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order was filled or not.
+        Args:
+            contract_id: ID of the contract to check.
 
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `FILLED`, `False`
-            otherwise.
+        Returns:
+            bool: True if the contract is active, False otherwise.
         """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'FILLED':
-            return True
-        else:
-            return False
-
-    @property
-    def is_rejected(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order was rejected or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `REJECTED`, `False`
-            otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'REJECTED':
-            return True
-        else:
-            return False
-
-    @property
-    def is_expired(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order has expired or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `EXPIRED`, `False`
-            otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'EXPIRED':
-            return True
-        else:
-            return False
-
-    @property
-    def is_replaced(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order has been replaced or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `REPLACED`, `False`
-            otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'REPLACED':
-            return True
-        else:
-            return False
-
-    @property
-    def is_working(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order is working or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `WORKING`, `False`
-            otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'WORKING':
-            return True
-        else:
-            return False
-
-    @property
-    def is_pending_activation(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order is pending activation or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `PENDING_ACTIVATION`, 
-            `False` otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'PENDING_ACTIVATION':
-            return True
-        else:
-            return False
-
-    @property
-    def is_pending_cancel(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order is pending cancellation or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `PENDING_CANCEL`, 
-            `False` otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'PENDING_CANCEL':
-            return True
-        else:
-            return False
-
-    @property
-    def is_pending_replace(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order is pending replacement or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `PENDING_REPLACE`, 
-            `False` otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'PENDING_REPLACE':
-            return True
-        else:
-            return False
-
-    @property
-    def is_queued(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order is in the queue or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `QUEUED`, `False`
-            otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'QUEUED':
-            return True
-        else:
-            return False
-
-    @property
-    def is_accepted(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order was accepted or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `ACCEPTED`, `False`
-            otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'ACCEPTED':
-            return True
-        else:
-            return False
-
-    @property
-    def is_awaiting_parent_order(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order is waiting for the parent order
-        to execute or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `AWAITING_PARENT_ORDER`,
-            `False` otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'AWAITING_PARENT_ORDER':
-            return True
-        else:
-            return False
-
-    @property
-    def is_awaiting_condition(self, refresh_order_info: bool = True) -> bool:
-        """Specifies whether the order is waiting for the condition
-        to execute or not.
-
-        Arguments:
-        ----
-        refresh_order_info {bool} -- Specifies whether you want
-            to refresh the order data from the TD API before 
-            checking. If `True` a request will be made to the
-            TD API to grab the latest Order Info.
-
-        Returns
-        -------
-        bool
-            `True` if the order status is `AWAITING_CONDITION`,
-            `False` otherwise.
-        """
-
-        if refresh_order_info:
-            self.trade_obj._update_order_status()
-
-        if self.order_status == 'AWAITING_CONDITION':
-            return True
-        else:
+        try:
+            contract = await self.api.proposal_open_contract({"contract_id": contract_id})
+            status = contract.get("status", "unknown")
+            self.logger.debug(f"Contract {contract_id} status: {status}")
+            return status == "open"
+        except Exception as e:
+            self.logger.error(f"Error checking contract {contract_id}: {e}")
             return False

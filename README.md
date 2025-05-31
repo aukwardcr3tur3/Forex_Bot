@@ -25,13 +25,18 @@ An advanced forex trading bot that incorporates risk management techniques, erro
 
 9. Create a .env file in the project directory and add your Deriv API token:
 
+DERIV_API_TOKEN=
+APP_ID=
 
 10. DERIV_API_TOKEN=your_api_token_here
 
 11. Run the bot:
-   python main.py
+   python3 Forex-Main.py
 
    The bot will start running, and you can access the web interface at http://localhost:8080.
+
+   #Checkout Arbitagelab (https://hudsonthames.org/arbitragelab/)
+   #Checkout GeneticAlgos(https://slicematrix.github.io/python-docs/)
 
 11. To interact with the bot through the web interface, you can use curl commands or any HTTP client:
 

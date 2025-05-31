@@ -1,681 +1,320 @@
+import logging
+from typing import List, Dict, Optional, Tuple
 import numpy as np
+import pandas as pd
+import torch
+import talib  # TA-Lib for technical indicators
 
-from pandas import DataFrame
-from typing import Tuple
-from typing import List    
-from typing import Optional
-
-
+from config import Config
 from data_manager import DataManager
 from deriv_api import DerivAPI
 
+class PortfolioManager:
+    def __init__(
+        self,
+        config: Config,
+        data_manager: DataManager,
+        api: DerivAPI,
+        logger: logging.Logger,
+        account_number: Optional[str] = None
+    ):
+        """Initialize a PortfolioManager for forex trading and AI-based optimization.
 
-
-class PortfolioManager():
-    def __init__(self, config, account_number: Optional[str] = None) -> None:
-        """Initalizes a new instance of the Portfolio object.
-
-        Keyword Arguments:
-        ----
-        account_number {str} -- An accout number to associate with the Portfolio. (default: {None})
+        Args:
+            config: Configuration object.
+            data_manager: DataManager for price data.
+            api: DerivAPI instance for platform interaction.
+            logger: Logger for debugging and monitoring.
+            account_number: Optional account number for the portfolio.
         """
-
-        self.positions = {}
-        self.positions_count = 0
-
-        self.profit_loss = 0.00 
-        self.market_value = 0.00  
-        self.risk_tolerance = 0.00    
-        self.account_number = account_number
-
-        self._historical_prices = []
-
-        self._td_client: TDClient = None
-        self._stock_frame: DataManager = None
-        self._stock_frame_daily: DataManager = None
-
-
         self.config = config
-        self.positions = {symbol: [] for symbol in config.SYMBOLS}
+        self.data_manager = data_manager
+        self.api = api
+        self.logger = logger
+        self.account_number = account_number
+        self.positions: Dict[str, List[Dict]] = {symbol: [] for symbol in config.symbols}
+        self.profit_loss: float = 0.0
+        self.positions_count: int = 0
 
-    def add_trade(self, symbol, contract):
+    def add_trade(self, symbol: str, contract: Dict):
+        """Add a trade contract to the portfolio.
+
+        Args:
+            symbol: Symbol of the instrument (e.g., 'frxEURUSD').
+            contract: Contract details from DerivAPI.
+        """
+        if symbol not in self.positions:
+            self.logger.warning(f"Symbol {symbol} not in config.symbols")
+            self.positions[symbol] = []
         self.positions[symbol].append(contract)
+        self.positions_count += 1
+        self.logger.info(f"Added trade for {symbol}: contract_id={contract.get('contract_id')}")
 
-    def close_trade(self, symbol, contract_id):
-        self.positions[symbol] = [c for c in self.positions[symbol] if c['id'] != contract_id]
+    def close_trade(self, symbol: str, contract_id: str):
+        """Close a trade by removing its contract.
 
-    def get_open_positions(self):
+        Args:
+            symbol: Symbol of the instrument.
+            contract_id: ID of the contract to close.
+        """
+        if symbol in self.positions:
+            initial_count = len(self.positions[symbol])
+            self.positions[symbol] = [
+                c for c in self.positions[symbol] if c.get("contract_id") != contract_id
+            ]
+            if len(self.positions[symbol]) < initial_count:
+                self.positions_count -= 1
+                self.logger.info(f"Closed trade for {symbol}: contract_id={contract_id}")
+            else:
+                self.logger.warning(f"Contract {contract_id} not found for {symbol}")
+        else:
+            self.logger.warning(f"Symbol {symbol} not in portfolio")
+
+    def get_open_positions(self) -> Dict[str, int]:
+        """Get the number of open positions per symbol.
+
+        Returns:
+            Dict mapping symbols to the number of open contracts.
+        """
         return {symbol: len(positions) for symbol, positions in self.positions.items()}
 
-    def get_total_exposure(self):
+    def get_total_exposure(self) -> int:
+        """Get the total number of open contracts.
+
+        Returns:
+            Total number of open contracts across all symbols.
+        """
         return sum(len(positions) for positions in self.positions.values())
 
-
-
-    def add_positions(self, positions: List[dict]) -> dict:
-        """Add Multiple positions to the portfolio at once.
-
-        This method will take an iterable containing the values
-        normally passed through in the `add_position` endpoint and
-        then adds each position to the portfolio.
-
-        Arguments:
-        ----
-        positions {list[dict]} -- Multiple positions with the required arguments to be added.
+    async def get_current_value(self) -> float:
+        """Calculate the current market value of the portfolio.
 
         Returns:
-        ----
-        {dict} -- The current positions in the portfolio.
-
-        Usage:
-        ----
-            >>> # Define mutliple positions to add.
-            >>> multi_position = [
-                {
-                    'asset_type': 'equity',
-                    'quantity': 2,
-                    'purchase_price': 4.00,
-                    'symbol': 'TSLA',
-                    'purchase_date': '2020-01-31'
-                },
-                {
-                    'asset_type': 'equity',
-                    'quantity': 2,0
-                    'purchase_price': 4.00,
-                    'symbol': 'SQ',
-                    'purchase_date': '2020-01-31'
-                }
-            ]
-            >>> new_positions = trading_robot.portfolio.add_positions(positions=multi_position)
-            {
-                'SQ': {
-                    'asset_type': 'equity',
-                    'purchase_date': '2020-01-31',
-                    'purchase_price': 4.00,
-                    'quantity': 2,
-                    'symbol': 'SQ'
-                },
-                'TSLA': {
-                    'asset_type': 'equity',
-                    'purchase_date': '2020-01-31',
-                    'purchase_price': 4.00,
-                    'quantity': 2,
-                    'symbol': 'TSLA'
-                }
-            }
+            Total market value based on current prices.
         """
-
-        if isinstance(positions, list):
-
-            # Loop through each position.
-            for position in positions:
-
-                # Add the position.
-                self.add_position(
-                    symbol=position['symbol'],
-                    asset_type=position['asset_type'],
-                    quantity=position.get('quantity', 0),
-                    purchase_price=position.get('purchase_price', 0.0),
-                    purchase_date=position.get('purchase_date', None)
-                )
-
-            return self.positions
-
-        else:
-            raise TypeError('Positions must be a list of dictionaries.')
-
-    def add_position(self, symbol: str, asset_type: str, purchase_date: Optional[str] = None, quantity: int = 0, purchase_price: float = 0.0) -> dict:
-        """Adds a single new position to the the portfolio.
-
-        Arguments:
-        ----
-        symbol {str} -- The Symbol of the Financial Instrument. Example: 'AAPL' or '/ES'
-
-        asset_type {str} -- The type of the financial instrument to be added. For example,
-            'equity', 'forex', 'option', 'futures'
-
-        Keyword Arguments:
-        ----
-        quantity {int} -- The number of shares or contracts you own. (default: {0})
-
-        purchase_price {float} -- The price at which the position was purchased. (default: {0.00})
-
-        purchase_date {str} -- The date which the asset was purchased. Must be ISO Format "YYYY-MM-DD"
-            For example, "2020-04-01" (default: {None})
-
-        Returns:
-        ----
-        {dict} -- A dictionary object that represents a position in the portfolio.
-
-        Usage:
-        ----
-            >>> portfolio = Portfolio()
-            >>> new_position = Portfolio.add_position(symbol='MSFT', 
-                    asset_type='equity', 
-                    quantity=2, 
-                    purchase_price=4.00,
-                    purchase_date="2020-01-31"
-                )
-            >>> new_position
-            {
-                'asset_type': 'equity', 
-                'quantity': 2, 
-                'purchase_price': 4.00,
-                'symbol': 'MSFT',
-                'purchase_date': '2020-01-31'
-            }
-        """
-
-        self.positions[symbol] = {}
-        self.positions[symbol]['symbol'] = symbol
-        self.positions[symbol]['quantity'] = quantity
-        self.positions[symbol]['purchase_price'] = purchase_price
-        self.positions[symbol]['purchase_date'] = purchase_date
-        self.positions[symbol]['asset_type'] = asset_type
-
-        if purchase_date:
-            self.positions[symbol]['ownership_status'] = True
-        else:
-            self.positions[symbol]['ownership_status'] = False
-
-        return self.positions[symbol]
-
-    def remove_position(self, symbol: str) -> Tuple[bool, str]:
-        """Deletes a single position from the portfolio.
-
-        Arguments:
-        ----
-        symbol {str} -- The symbol of the instrument to be deleted. Example: 'AAPL' or '/ES'
-
-        Returns:
-        ----
-        {Tuple[bool, str]} -- Returns `True` if successfully deleted, `False` otherwise 
-            along with a message.
-
-        Usage:
-        ----
-            >>> portfolio = Portfolio()
-
-            >>> new_position = Portfolio.add_position(
-                    symbol='MSFT', 
-                    asset_type='equity', 
-                    quantity=2, 
-                    purchase_price=4.00,
-                    purchase_date="2020-01-31"
-                )
-            >>> delete_status = Portfolio.delete_position(symbol='MSFT')
-            >>> delete_status
-            (True, 'MSFT was successfully removed.')
-
-            >>> delete_status = Portfolio.delete_position(symbol='AAPL')
-            >>> delete_status
-            (False, 'AAPL did not exist in the porfolio.')
-        """
-
-        if symbol in self.positions:
-            del self.positions[symbol]
-            return (True, "{symbol} was successfully removed.".format(symbol=symbol))
-        else:
-            return (False, "{symbol} did not exist in the porfolio.".format(symbol=symbol))
-
-    def total_allocation(self) -> dict:
-        """Returns a summary of the portfolio by asset allocation."""
-
-        total_allocation = {
-            'stocks': [],
-            'fixed_income': [],
-            'options': [],
-            'futures': [],
-            'furex': []
-        }
-
-        if len(self.positions.keys()) > 0:
-            for symbol in self.positions:
-                total_allocation[self.positions[symbol]['asset_type']].append(self.positions[symbol])
-
-    def portfolio_variance(self, weights: dict, covariance_matrix: DataFrame) -> dict:
-
-        sorted_keys = list(weights.keys())
-        sorted_keys.sort()
-
-        sorted_weights = np.array([weights[symbol] for symbol in sorted_keys])
-        portfolio_variance = np.dot(
-            sorted_weights.T,
-            np.dot(covariance_matrix, sorted_weights)
-        )
-
-        return portfolio_variance
-
-    def portfolio_metrics(self) -> dict:
-        """Calculates different portfolio risk metrics using daily data.
-
-        Overview:
-        ----
-        To build an effective summary of our portfolio we will need to
-        calculate different metrics that help represent the risk of our
-        portfolio and it's performance. The following metrics will be calculated
-        in this method:
-
-        1. Standard Deviation of Percent Returns.
-        2. Covariance of Percent Returns.
-        2. Variance of Percent Returns.
-        3. Average Percent Return
-        4. Weighted Average Percent Return.
-        5. Portfolio Variance.
-
-        Returns:
-        ----
-        dict -- [description]
-        """
-
-        if not self._stock_frame_daily:
-            self._grab_daily_historical_prices()
-
-        # Calculate the weights.
-        porftolio_weights = self.portfolio_weights()
-
-        # Calculate the Daily Returns (%)
-        self._stock_frame_daily.frame['daily_returns_pct'] = self._stock_frame_daily.symbol_groups['close'].transform(
-            lambda x: x.pct_change()
-        )
-
-        # Calculate the Daily Returns (Mean)
-        self._stock_frame_daily.frame['daily_returns_avg'] = self._stock_frame_daily.symbol_groups['daily_returns_pct'].transform(
-            lambda x: x.mean()
-        )
-
-        # Calculate the Daily Returns (Standard Deviation)
-        self._stock_frame_daily.frame['daily_returns_std'] = self._stock_frame_daily.symbol_groups['daily_returns_pct'].transform(
-            lambda x: x.std()
-        )
-
-        # Calculate the Covariance.
-        returns_cov = self._stock_frame_daily.frame.unstack(
-            level=0)['daily_returns_pct'].cov()
-
-        # Take the other columns and get ready to add them to our dictionary.
-        returns_avg = self._stock_frame_daily.symbol_groups['daily_returns_avg'].tail(
-            n=1
-        ).to_dict()
-
-        returns_std = self._stock_frame_daily.symbol_groups['daily_returns_std'].tail(
-            n=1
-        ).to_dict()
-
-        metrics_dict = {}
-
-        portfolio_variance = self.portfolio_variance(
-            weights=porftolio_weights,
-            covariance_matrix=returns_cov
-        )
-
-        for index_tuple in returns_std:
-
-            symbol = index_tuple[0]
-            metrics_dict[symbol] = {}
-            metrics_dict[symbol]['weight'] = porftolio_weights[symbol]
-            metrics_dict[symbol]['average_returns'] = returns_avg[index_tuple]
-            metrics_dict[symbol]['weighted_returns'] = returns_avg[index_tuple] * \
-                metrics_dict[symbol]['weight']
-            metrics_dict[symbol]['standard_deviation_of_returns'] = returns_std[index_tuple]
-            metrics_dict[symbol]['variance_of_returns'] = returns_std[index_tuple] ** 2
-            metrics_dict[symbol]['covariance_of_returns'] = returns_cov.loc[[
-                symbol]].to_dict()
-
-        metrics_dict['portfolio'] = {}
-        metrics_dict['portfolio']['variance'] = portfolio_variance
-
-        return metrics_dict
-
-    def portfolio_weights(self) -> dict:
-        """Calculate the weights for each position in the portfolio
-
-        Returns:
-        ----
-        {dict} -- Each symbol with their designated weights.
-        """
-
-        weights = {}
-
-        # First grab all the symbols.
-        symbols = self.positions.keys()
-
-        # Grab the quotes.
-        quotes = self.td_client.get_quotes(instruments=list(symbols))
-
-        # Grab the projected market value.
-        projected_market_value_dict = self.projected_market_value(
-            current_prices=quotes
-        )
-
-        # Loop through each symbol.
-        for symbol in projected_market_value_dict:
-
-            # Calculate the weights.
-            if symbol != 'total':
-                weights[symbol] = projected_market_value_dict[symbol]['total_market_value'] / \
-                    projected_market_value_dict['total']['total_market_value']
-
-        return weights
-
-    def portfolio_summary(self):
-        """Generates a summary of our portfolio."""
-
-        # First grab all the symbols.
-        symbols = self.positions.keys()
-
-        # Grab the quotes.
-        quotes = self.td_client.get_quotes(instruments=list(symbols))
-
-        portfolio_summary_dict = {}
-        portfolio_summary_dict['projected_market_value'] = self.projected_market_value(
-            current_prices=quotes
-        )
-        portfolio_summary_dict['portfolio_weights'] = self.portfolio_weights()
-        portfolio_summary_dict['portfolio_risk'] = ""
-
-        return portfolio_summary_dict
-
-    def in_portfolio(self, symbol: str) -> bool:
-        """checks if the symbol is in the portfolio.
-
-        Arguments:
-        ----
-        symbol {str} -- The symbol of the instrument to be deleted. Example: 'AAPL' or '/ES'
-
-        Returns:
-        ----
-        bool -- `True` if the position is in the portfolio, `False` otherwise.
-
-        Usage:
-        ----
-            >>> portfolio = Portfolio()
-            >>> new_position = Portfolio.add_position(
-                symbol='MSFT', 
-                asset_type='equity'
-            )
-            >>> in_position_flag = Portfolio.in_portfolio(symbol='MSFT')
-            >>> in_position_flag
-                True
-        """
-
-        if symbol in self.positions:
-            return True
-        else:
-            return False
-
-    def get_ownership_status(self, symbol: str) -> bool:
-        """Gets the ownership status for a position in the portfolio.
-
-        Arguments:
-        ----
-        symbol {str} -- The symbol you want to grab the ownership status for.
-
-        Returns:
-        ----
-        {bool} -- `True` if the we own the position, `False` if we do not own it.
-        """
-
-        if self.in_portfolio(symbol=symbol) and self.positions[symbol]['ownership_status']:
-            return self.positions[symbol]['ownership_status']
-        else:
-            return False
-
-    def set_ownership_status(self, symbol: str, ownership: bool) -> None:
-        """Sets the ownership status for a position in the portfolio.
-
-        Arguments:
-        ----
-        symbol {str} -- The symbol you want to change the ownership status for.
-
-        ownership {bool} -- The ownership status you want the symbol to have. Can either
-            be `True` or `False`.
-
-        Raises:
-        ----
-        KeyError: If the symbol does not exist in the portfolio it will return an error.
-        """
-
-        if self.in_portfolio(symbol=symbol):
-            self.positions[symbol]['ownership_status'] = ownership
-        else:
-            raise KeyError(
-                "Can't set ownership status, as you do not have the symbol in your portfolio."
-            )
-
-    def is_profitable(self, symbol: str, current_price: float) -> bool:
-        """Specifies whether a position is profitable.
-
-        Arguments:
-        ----
-        symbol {str} -- The symbol of the instrument, to check profitability.
-
-        current_price {float} -- The current trading price of the instrument.
-
-        Returns:
-        ----
-        {bool} -- Specifies whether the position is profitable or flat `True` or not
-            profitable `False`.
-
-        Raises:
-        ----
-        KeyError: If the Symbol does not exist it will return a key error.
-
-        Usage:
-        ----
-            >>> portfolio = Portfolio()
-            >>> new_position = Portfolio.add_position(
-                symbol='MSFT', 
-                asset_type='equity',
-                purchase_price=4.00,
-                purchase_date="2020-01-31"
-            )
-            >>> is_profitable_flag = Portfolio.is_profitable(
-                symbol='MSFT',
-                current_price=7.00
-            )
-            >>> is_profitable_flag
-            True
-        """
-
-        # Grab the purchase price, if it exists.
-        if self.in_portfolio(symbol=symbol):
-            purchase_price = self.positions[symbol]['purchase_price']
-        else:
-            raise KeyError("The Symbol you tried to request does not exist.")
-
-        if (purchase_price <= current_price):
-            return True
-        elif (purchase_price > current_price):
-            return False
-
-    def projected_market_value(self, current_prices: dict) -> dict:
-        """Returns the Projected market value for all the positions in the portfolio.
-
-        Arguments:
-        ----
-        current_prices {dict} -- A dictionary of current quotes for each of the symbols
-            in the portfolio.
-
-        Returns:
-        ----
-        dict -- A summarized version of the portfolio with each position, purchase price, current price,
-            and projected values.
-
-        Usage:
-        ----
-            >>> portfolio = Portfolio()
-            >>> new_position = portfolio.add_position(
-                symbol='MSFT', 
-                asset_type='equity',
-                purchase_price=4.00,
-                purchase_date="2020-01-31"
-            )
-            >>> portfolio_summary = portfolio.projected_market_value(current_prices={'MSFT':{'lastPrice': 8.00, 'openPrice': 7.50}})        
-        """
-
-        projected_value = {}
         total_value = 0.0
-        total_invested_capital = 0.0
-        total_profit_or_loss = 0.0
+        for symbol, contracts in self.positions.items():
+            snapshot = self.data_manager.get_snapshot(symbol)
+            if snapshot is None or snapshot.empty:
+                self.logger.warning(f"No snapshot for {symbol}")
+                continue
+            current_price = snapshot['close'].iloc[-1]
+            for contract in contracts:
+                quantity = contract.get('amount', 0)
+                total_value += current_price * quantity
+        self.logger.debug(f"Portfolio value: {total_value:.2f}")
+        return total_value
 
-        position_count_profitable = 0
-        position_count_not_profitable = 0
-        position_count_break_even = 0
+    async def get_historical_returns(self, lookback: int = 252) -> np.ndarray:
+        """Compute historical returns for all symbols over a lookback period.
 
-        for symbol in current_prices:
+        Args:
+            lookback: Number of periods (e.g., days) to consider.
 
-            if self.in_portfolio(symbol=symbol):
+        Returns:
+            NumPy array of shape (lookback, n_assets) with daily returns.
+        """
+        snapshots = {s: self.data_manager.get_snapshot(s) for s in self.config.symbols}
+        valid_snapshots = {s: df for s, df in snapshots.items() if df is not None and not df.empty}
+        if not valid_snapshots:
+            self.logger.warning("No valid snapshots for returns calculation")
+            return np.zeros((lookback, len(self.config.symbols)))
 
-                projected_value[symbol] = {}
-                current_quantity = self.positions[symbol]['quantity']
-                purchase_price = self.positions[symbol]['purchase_price']
-                current_price = current_prices[symbol]['lastPrice']
-                is_profitable = self.is_profitable(
-                    symbol=symbol, current_price=current_price)
-
-                projected_value[symbol]['purchase_price'] = purchase_price
-                projected_value[symbol]['current_price'] = current_prices[symbol]['lastPrice']
-                projected_value[symbol]['quantity'] = current_quantity
-                projected_value[symbol]['is_profitable'] = is_profitable
-
-                # Calculate total market value.
-                projected_value[symbol]['total_market_value'] = (
-                    current_price * current_quantity
+        returns = pd.DataFrame({
+            s: df['close'].pct_change().dropna().tail(lookback) for s, df in valid_snapshots.items()
+        }).fillna(0)
+        returns_array = np.zeros((lookback, len(self.config.symbols)))
+        for i, symbol in enumerate(self.config.symbols):
+            if symbol in returns:
+                returns_array[:, i] = returns[symbol].values[-lookback:] if len(returns[symbol]) >= lookback else np.pad(
+                    returns[symbol].values, (lookback - len(returns[symbol]), 0), mode='constant'
                 )
+        self.logger.debug(f"Historical returns shape: {returns_array.shape}")
+        return returns_array
 
-                # Calculate total invested capital.
-                projected_value[symbol]['total_invested_capital'] = (
-                    current_quantity * purchase_price
-                )
+    async def get_covariance_matrix(self, lookback: int = 252) -> np.ndarray:
+        """Compute the covariance matrix of asset returns.
 
-                projected_value[symbol]['total_loss_or_gain_$'] = ((current_price - purchase_price) * current_quantity)
-                projected_value[symbol]['total_loss_or_gain_%'] = round(((current_price - purchase_price) / purchase_price), 4)
-
-                total_value += projected_value[symbol]['total_market_value']
-                total_profit_or_loss += projected_value[symbol]['total_loss_or_gain_$']
-                total_invested_capital += projected_value[symbol]['total_invested_capital']
-
-                if projected_value[symbol]['total_loss_or_gain_$'] > 0:
-                    position_count_profitable += 1
-                elif projected_value[symbol]['total_loss_or_gain_$'] < 0:
-                    position_count_not_profitable += 1
-                else:
-                    position_count_break_even += 1
-
-        projected_value['total'] = {}
-        projected_value['total']['total_positions'] = len(self.positions)
-        projected_value['total']['total_market_value'] = total_value
-        projected_value['total']['total_invested_capital'] = total_invested_capital
-        projected_value['total']['total_profit_or_loss'] = total_profit_or_loss
-        projected_value['total']['number_of_profitable_positions'] = position_count_profitable
-        projected_value['total']['number_of_non_profitable_positions'] = position_count_not_profitable
-        projected_value['total']['number_of_breakeven_positions'] = position_count_break_even
-
-        return projected_value
-
-    @property
-    def historical_prices(self) -> List[dict]:
-        """Gets the historical prices for the Portfolio
+        Args:
+            lookback: Number of periods for returns calculation.
 
         Returns:
-        ----
-        List[dict] -- A list of historical candle prices.
+            NumPy array of shape (n_assets, n_assets) with covariance matrix.
         """
+        returns = await self.get_historical_returns(lookback)
+        cov_matrix = np.cov(returns.T)
+        self.logger.debug(f"Covariance matrix shape: {cov_matrix.shape}")
+        return cov_matrix
 
-        return self._historical_prices
+    async def get_feature_tensors(self, lookback: int = 252, features: List[str] = None) -> torch.Tensor:
+        """Generate feature tensors for AI models using TA-Lib indicators.
 
-    @historical_prices.setter
-    def historical_prices(self, historical_prices: List[dict]) -> None:
-        """Sets the historical prices for the Portfolio
-
-        Arguments:
-        ----
-        historical_prices {List[dict]} -- A list of historical candle prices.
-        """
-
-        self._historical_prices = historical_prices
-
-    @property
-    def stock_frame(self) -> DataManager:
-        """Gets the DataManager object for the Portfolio
+        Args:
+            lookback: Number of periods for feature calculation.
+            features: List of features to include (e.g., ['rsi', 'sma', 'volatility']). Defaults to a standard set.
 
         Returns:
-        ----
-        {DataManager} -- A DataManager object with symbol groups, and rolling windows.
+            PyTorch tensor of shape (n_channels, lookback, n_assets).
         """
+        if features is None:
+            features = ['rsi', 'sma', 'volatility']
+        snapshots = {s: self.data_manager.get_snapshot(s) for s in self.config.symbols}
+        valid_snapshots = {s: df for s, df in snapshots.items() if df is not None and not df.empty}
+        if not valid_snapshots:
+            self.logger.warning("No valid snapshots for feature calculation")
+            return torch.zeros((len(features), lookback, len(self.config.symbols)))
 
-        return self._stock_frame
+        feature_data = []
+        for feature in features:
+            feature_array = np.zeros((lookback, len(self.config.symbols)))
+            for i, symbol in enumerate(self.config.symbols):
+                if symbol not in valid_snapshots:
+                    continue
+                df = valid_snapshots[symbol].tail(lookback + 20)  # Extra data for indicator calculations
+                close_prices = df['close'].values
+                try:
+                    if feature == 'rsi':
+                        if len(close_prices) >= 14:
+                            rsi = talib.RSI(close_prices, timeperiod=14)
+                            feature_array[:, i] = rsi[-lookback:] if len(rsi) >= lookback else np.pad(
+                                rsi, (lookback - len(rsi), 0), mode='constant'
+                            )
+                    elif feature == 'sma':
+                        if len(close_prices) >= 20:
+                            sma = talib.SMA(close_prices, timeperiod=20)
+                            feature_array[:, i] = sma[-lookback:] if len(sma) >= lookback else np.pad(
+                                sma, (lookback - len(sma), 0), mode='constant'
+                            )
+                    elif feature == 'volatility':
+                        if len(close_prices) >= 20:
+                            returns = np.diff(close_prices) / close_prices[:-1]
+                            volatility = talib.STDDEV(returns, timeperiod=20)
+                            feature_array[:, i] = volatility[-lookback:] if len(volatility) >= lookback else np.pad(
+                                volatility, (lookback - len(volatility), 0), mode='constant'
+                            )
+                except Exception as e:
+                    self.logger.error(f"Error calculating {feature} for {symbol}: {e}")
+                    feature_array[:, i] = np.zeros(lookback)
+            feature_data.append(feature_array)
+        tensor = torch.tensor(feature_data, dtype=torch.float32)
+        self.logger.debug(f"Feature tensor shape: {tensor.shape}")
+        return tensor
 
-    @stock_frame.setter
-    def stock_frame(self, stock_frame: DataManager) -> None:
-        """Sets the DataManager object for the Portfolio
+    async def optimize_allocation(self, method: str = 'risk_parity', predicted_returns: Optional[np.ndarray] = None) -> Dict[str, float]:
+        """Optimize portfolio weights using an AI-inspired method.
 
-        Arguments:
-        ----
-        stock_frame {DataManager} -- A DataManager object with symbol groups, and rolling windows.
-        """
-
-        self._stock_frame = stock_frame
-
-    @property
-    def deriv_client(self) -> DerivAPI:
-        """Gets the DerivAPIClient object for the Portfolio.
+        Args:
+            method: Optimization method ('risk_parity' or 'max_sharpe').
+            predicted_returns: Optional array of predicted returns for max_sharpe method.
 
         Returns:
-        ----
-        DerivAPIClient -- An authenticated session with the Deriv API.
+            Dictionary mapping symbols to optimized weights.
         """
-        return self.api
+        cov_matrix = await self.get_covariance_matrix()
+        n_assets = len(self.config.symbols)
+        weights = np.ones(n_assets) / n_assets  # Equal weights as fallback
 
-    @deriv_client.setter
-    def deriv_client(self, api_client: DerivAPI) -> None:
-        """Sets the DerivAPIClient object for the Portfolio.
+        if method == 'risk_parity':
+            volatilities = np.sqrt(np.diag(cov_matrix))
+            weights = (1 / volatilities) / np.sum(1 / volatilities)
+        elif method == 'max_sharpe' and predicted_returns is not None:
+            risk_free_rate = 0.02 / 252  # Annualized, daily
+            excess_returns = predicted_returns - risk_free_rate
+            inv_cov = np.linalg.inv(cov_matrix)
+            weights = inv_cov @ excess_returns
+            weights = weights / np.sum(np.abs(weights))
 
-        Arguments:
-        ----
-        api_client {DerivAPIClient} -- An authenticated session with the Deriv API.
-        """
-        self.api = api_client
+        weights_dict = {symbol: max(0, w) for symbol, w in zip(self.config.symbols, weights)}
+        total = sum(weights_dict.values())
+        if total > 0:
+            weights_dict = {s: w / total for s, w in weights_dict.items()}
+        self.logger.debug(f"Optimized weights: {weights_dict}")
+        return weights_dict
 
-    def _grab_daily_historical_prices(self) -> DataManager:
-        """Grabs the daily historical prices for each position.
+    async def export_deepdow_dataset(self, lookback: int = 252, features: List[str] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Export data in deepdow-compatible format.
+
+        Args:
+            lookback: Number of periods for data.
+            features: List of features for feature tensor.
 
         Returns:
-        ----
-        {DataManager} -- A DataManager object with data organized, grouped, and sorted.
+            Tuple of (returns_tensor, feature_tensor) with shapes (lookback, n_assets) and (n_channels, lookback, n_assets).
         """
+        returns = await self.get_historical_returns(lookback)
+        features = await self.get_feature_tensors(lookback, features)
+        returns_tensor = torch.tensor(returns, dtype=torch.float32)
+        self.logger.debug(f"Deepdow dataset: returns_shape={returns_tensor.shape}, features_shape={features.shape}")
+        return returns_tensor, features
 
-        new_prices = []
+    async def predict_returns(self, lookback: int = 252) -> np.ndarray:
+        """Placeholder for predicting asset returns using a deep learning model.
 
-        # Loop through each position.
+        Args:
+            lookback: Number of periods for feature data.
+
+        Returns:
+            NumPy array of predicted returns for each asset.
+        """
+        self.logger.warning("Return prediction not implemented. Returning zero predictions.")
+        return np.zeros(len(self.config.symbols))
+
+    async def portfolio_metrics(self) -> Dict:
+        """Calculate portfolio risk and performance metrics.
+
+        Returns:
+            Dictionary with metrics like variance, returns, and weights.
+        """
+        metrics = {}
+        weights = await self.portfolio_weights()
+        snapshots = {s: self.data_manager.get_snapshot(s) for s in self.config.symbols}
+        valid_snapshots = {s: df for s, df in snapshots.items() if df is not None and not df.empty}
+
+        if not valid_snapshots:
+            self.logger.warning("No valid snapshots for metrics calculation")
+            return {"portfolio": {"variance": 0.0}}
+
+        daily_returns = pd.DataFrame({
+            s: df['close'].pct_change().dropna() for s, df in valid_snapshots.items()
+        })
+        if daily_returns.empty:
+            self.logger.warning("No daily returns data")
+            return {"portfolio": {"variance": 0.0}}
+
+        cov_matrix = daily_returns.cov()
+        portfolio_variance = np.sqrt(np.dot(
+            np.array([weights.get(s, 0) for s in daily_returns.columns]).T,
+            np.dot(cov_matrix, np.array([weights.get(s, 0) for s in daily_returns.columns]))
+        ))
+
+        for symbol in valid_snapshots:
+            metrics[symbol] = {
+                "weight": weights.get(symbol, 0),
+                "average_returns": daily_returns[symbol].mean(),
+                "std_returns": daily_returns[symbol].std(),
+                "variance_returns": daily_returns[symbol].std() ** 2
+            }
+        metrics["portfolio"] = {"variance": portfolio_variance}
+        self.logger.debug(f"Portfolio metrics: {metrics}")
+        return metrics
+
+    async def portfolio_weights(self) -> Dict[str, float]:
+        """Calculate the weight of each symbol in the portfolio.
+
+        Returns:
+            Dictionary mapping symbols to their portfolio weights.
+        """
+        weights = {}
+        total_value = 0.0
         for symbol in self.positions:
-
-            # Grab the historical prices.
-            historical_prices_response = self.td_client.get_price_history(
-                symbol=symbol,
-                period_type='year',
-                period=1,
-                frequency_type='daily',
-                frequency=1,
-                extended_hours=True
-            )
-
-            # Loop through the chandles.
-            for candle in historical_prices_response['candles']:
-
-                new_price_mini_dict = {}
-                new_price_mini_dict['symbol'] = symbol
-                new_price_mini_dict['open'] = candle['open']
-                new_price_mini_dict['close'] = candle['close']
-                new_price_mini_dict['high'] = candle['high']
-                new_price_mini_dict['low'] = candle['low']
-                new_price_mini_dict['volume'] = candle['volume']
-                new_price_mini_dict['datetime'] = candle['datetime']
-                new_prices.append(new_price_mini_dict)
-
-        # Create and set the DataManager
-        self._stock_frame_daily = DataManager(data=new_prices)
-        self._stock_frame_daily.create_frame()
-
-        return self._stock_frame_daily
+            snapshot = self.data_manager.get_snapshot(symbol)
+            if snapshot is None or snapshot.empty:
+                self.logger.warning(f"No snapshot for {symbol}")
+                continue
+            current_price = snapshot['close'].iloc[-1]
+            symbol_value = sum(c.get('amount', 0) * current_price for c in self.positions[symbol])
+            weights[symbol] = symbol_value
+            total_value += symbol_value
+        weights = {s: v / total_value if total_value > 0 else 0 for s, v in weights.items()}
+        self.logger.debug(f"Portfolio weights: {weights}")
+        return weights
